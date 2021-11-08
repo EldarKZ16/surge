@@ -2,26 +2,25 @@
 
 package surge.core
 
-import akka.actor.{ ActorRef, ActorSelection, ActorSystem, NoSerializationVerificationNeeded, PoisonPill, Props }
+import akka.actor.{ActorRef, ActorSelection, ActorSystem, NoSerializationVerificationNeeded, PoisonPill, Props}
 import akka.pattern._
 import akka.util.Timeout
 import com.typesafe.config.Config
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.header.Headers
 import org.slf4j.LoggerFactory
-import surge.health.{ HealthSignalBusAware, HealthSignalBusTrait }
+import surge.health.{HealthSignalBusAware, HealthSignalBusTrait}
 import surge.internal.SurgeModel
 import surge.internal.akka.actor.ActorLifecycleManagerActor
 import surge.internal.akka.kafka.KafkaConsumerPartitionAssignmentTracker
 import surge.internal.config.TimeoutConfig
-import surge.internal.kafka.{ KTableLagCheckerImpl, KafkaProducerActorImpl, PartitionerHelper }
+import surge.internal.kafka.{KTableLagCheckerImpl, KafkaProducerActorImpl, PartitionerHelper}
 import surge.kafka.streams._
-import surge.kafka.{ KafkaAdminClient, KafkaProducerTrait }
-import surge.metrics.{ MetricInfo, Metrics, Timer }
+import surge.kafka.{KafkaAdminClient, KafkaProducerTrait}
+import surge.metrics.{MetricInfo, Metrics, Timer}
 
-import scala.concurrent.duration.DurationInt
-import scala.concurrent.{ Await, ExecutionContext, Future }
-import scala.util.{ Failure, Success, Try }
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success, Try}
 
 object KafkaProducerActor {
   private val dispatcherName: String = "kafka-publisher-actor-dispatcher"
@@ -100,16 +99,13 @@ object KafkaProducerActor {
       metrics: Metrics,
       businessLogic: SurgeModel[_, _, _, _],
       signalBus: HealthSignalBusTrait,
-      numberOfPartitions: Int): String => KafkaProducerActor = (aggregateId: String) => {
+      numberOfPartitions: Int): String => KafkaProducerActorWithSelection = (aggregateId: String) => {
 
     val partitionNumber = PartitionerHelper.partitionForKey(aggregateId, numberOfPartitions)
     val assignedPartition = new TopicPartition(businessLogic.kafka.stateTopic.name, partitionNumber)
 
-    // FIXME
-    val timeout = 5.seconds
-    val publisherActor = Await.result(actorSystem.actorSelection(s"user/producer-actor-${assignedPartition.toString}").resolveOne(timeout), timeout)
-
-    new KafkaProducerActor(publisherActor, metrics, businessLogic.aggregateName, assignedPartition, signalBus)
+    val publisherActor = actorSystem.actorSelection(s"user/producer-actor-${assignedPartition.toString}")
+    new KafkaProducerActorWithSelection(publisherActor, metrics, businessLogic.aggregateName, assignedPartition, signalBus)
   }
 
   sealed trait PublishResult extends NoSerializationVerificationNeeded
@@ -227,3 +223,89 @@ class KafkaProducerActor(
       log.error(s"Unable to register $getClass for supervision", error)
   }
 }
+
+class KafkaProducerActorWithSelection(
+                          publisherActor: ActorSelection,
+                          metrics: Metrics,
+                          aggregateName: String,
+                          val assignedPartition: TopicPartition,
+                          override val signalBus: HealthSignalBusTrait)
+  extends HealthyComponent
+    with HealthSignalBusAware {
+  private implicit val executionContext: ExecutionContext = ExecutionContext.global
+  private val log = LoggerFactory.getLogger(getClass)
+
+  def publish(
+               aggregateId: String,
+               state: KafkaProducerActor.MessageToPublish,
+               events: Seq[KafkaProducerActor.MessageToPublish]): Future[KafkaProducerActor.PublishResult] = {
+    log.trace(s"Publishing state for {} {}", Seq(aggregateName, state.key): _*)
+    implicit val askTimeout: Timeout = Timeout(TimeoutConfig.PublisherActor.publishTimeout)
+    (publisherActor ? KafkaProducerActorImpl.Publish(eventsToPublish = events, state = state)).mapTo[KafkaProducerActor.PublishResult]
+  }
+
+  def terminate(): Unit = {
+    publisherActor ! PoisonPill
+  }
+
+  private val isAggregateStateCurrentTimer: Timer = metrics.timer(
+    MetricInfo(
+      s"surge.${aggregateName.toLowerCase()}.is-aggregate-current-timer",
+      "Average time in milliseconds taken to check if a particular aggregate is up to date in the KTable",
+      tags = Map("aggregate" -> aggregateName)))
+  def isAggregateStateCurrent(aggregateId: String): Future[Boolean] = {
+    implicit val askTimeout: Timeout = Timeout(TimeoutConfig.PublisherActor.aggregateStateCurrentTimeout)
+    isAggregateStateCurrentTimer.timeFuture {
+      (publisherActor ? KafkaProducerActorImpl.IsAggregateStateCurrent(aggregateId)).mapTo[Boolean]
+    }
+  }
+
+  def healthCheck(): Future[HealthCheck] = {
+    publisherActor
+      .ask(HealthyActor.GetHealth)(TimeoutConfig.HealthCheck.actorAskTimeout)
+      .mapTo[HealthCheck]
+      .recoverWith { case err: Throwable =>
+        log.error(s"Failed to get publisher-actor health check", err)
+        Future.successful(HealthCheck(name = "publisher-actor", id = aggregateName, status = HealthCheckStatus.DOWN))
+      }(ExecutionContext.global)
+  }
+
+  override def restart(): Future[Ack] = {
+    for {
+      _ <- stop()
+      started <- start()
+    } yield {
+      started
+    }
+  }
+
+  override def start(): Future[Ack] = {
+    implicit val askTimeout: Timeout = Timeout(TimeoutConfig.LifecycleManagerActor.askTimeout)
+
+    publisherActor.ask(ActorLifecycleManagerActor.Start).mapTo[Ack].andThen(registrationCallback())
+  }
+
+  override def stop(): Future[Ack] = {
+    implicit val askTimeout: Timeout = Timeout(TimeoutConfig.LifecycleManagerActor.askTimeout)
+
+    publisherActor.ask(ActorLifecycleManagerActor.Stop).mapTo[Ack]
+  }
+
+  override def shutdown(): Future[Ack] = stop()
+
+  private def registrationCallback(): PartialFunction[Try[Ack], Unit] = {
+    case Success(_) =>
+      val registrationResult =
+        signalBus.register(control = this, componentName = "kafka-producer-actor", restartSignalPatterns = restartSignalPatterns())
+
+      registrationResult.onComplete {
+        case Failure(exception) =>
+          log.error(s"$getClass registration failed", exception)
+        case Success(_) =>
+          log.debug(s"$getClass registration succeeded")
+      }
+    case Failure(error) =>
+      log.error(s"Unable to register $getClass for supervision", error)
+  }
+}
+

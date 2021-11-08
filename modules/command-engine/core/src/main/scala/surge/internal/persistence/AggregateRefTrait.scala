@@ -3,19 +3,16 @@
 package surge.internal.persistence
 
 import akka.actor.ActorRef
-import akka.actor.Status.Success
 import akka.pattern._
 import akka.util.Timeout
-import io.opentelemetry.api.trace.{ Span, Tracer }
-import org.slf4j.{ Logger, LoggerFactory }
-import surge.exceptions.{ SurgeTimeoutException, SurgeUnexpectedException }
+import io.opentelemetry.api.trace.{Span, Tracer}
+import org.slf4j.{Logger, LoggerFactory}
+import surge.exceptions.{SurgeTimeoutException, SurgeUnexpectedException}
 import surge.internal.config.TimeoutConfig
 import surge.internal.tracing.TracingHelper._
-import surge.internal.tracing.{ SpanSupport, TracedMessage }
-import surge.kafka.streams.SurgeHealthCheck
+import surge.internal.tracing.{SpanSupport, TracedMessage}
 
-import scala.concurrent.{ ExecutionContext, Future }
-import scala.util.Failure
+import scala.concurrent.{ExecutionContext, Future}
 
 /**
  * Generic reference to an aggregate that handles proxying messages to the actual aggregate actor responsible for a particular aggregate id. A single reference

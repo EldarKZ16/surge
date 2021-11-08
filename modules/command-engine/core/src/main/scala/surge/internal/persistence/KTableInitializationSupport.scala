@@ -4,8 +4,8 @@ package surge.internal.persistence
 
 import akka.actor.ActorContext
 import org.slf4j.LoggerFactory
-import surge.core.KafkaProducerActor
-import surge.exceptions.{ AggregateInitializationException, AggregateStateNotCurrentInKTableException }
+import surge.core.{KafkaProducerActor, KafkaProducerActorWithSelection}
+import surge.exceptions.{AggregateInitializationException, AggregateStateNotCurrentInKTableException}
 import surge.internal.config.RetryConfig
 import surge.kafka.streams.AggregateStateStoreKafkaStreams
 import surge.metrics.Timer
@@ -25,7 +25,7 @@ trait KTableInitializationSupport[Model] {
   def aggregateId: String
   def aggregateName: String
   def initializationMetrics: KTableInitializationMetrics
-  def kafkaProducerActor: KafkaProducerActor
+  def kafkaProducerActor: KafkaProducerActorWithSelection
   def kafkaStreamsCommand: AggregateStateStoreKafkaStreams[_]
   def deserializeState(bytes: Array[Byte]): Option[Model]
 

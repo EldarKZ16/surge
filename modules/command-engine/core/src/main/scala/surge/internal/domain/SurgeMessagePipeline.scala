@@ -2,25 +2,24 @@
 
 package surge.internal.domain
 
-import akka.actor.{ ActorRef, ActorSystem }
+import akka.actor.{ActorRef, ActorSystem}
 import akka.cluster.Cluster
 import akka.management.scaladsl.AkkaManagement
 import com.typesafe.config.Config
-import org.slf4j.{ Logger, LoggerFactory }
+import org.slf4j.{Logger, LoggerFactory}
 import play.api.libs.json.JsValue
-import surge.core.{ Ack, KafkaProducerActor, SurgePartitionRouter, SurgeProcessingTrait }
-import surge.health.{ HealthSignalBusAware, HealthSignalBusTrait }
+import surge.core.{Ack, KafkaProducerActor, SurgePartitionRouter, SurgeProcessingTrait}
+import surge.health.{HealthSignalBusAware, HealthSignalBusTrait}
 import surge.internal.SurgeModel
 import surge.internal.akka.cluster.ActorSystemHostAwareness
-import surge.internal.akka.kafka.{ CustomConsumerGroupRebalanceListener, KafkaConsumerPartitionAssignmentTracker, KafkaConsumerStateTrackingActor }
+import surge.internal.akka.kafka.{CustomConsumerGroupRebalanceListener, KafkaConsumerPartitionAssignmentTracker, KafkaConsumerStateTrackingActor}
 import surge.internal.health.HealthSignalStreamProvider
 import surge.internal.kafka.KafkaClusterShardingRebalanceListener
-import surge.internal.persistence.PersistentActorRegionCreator
 import surge.kafka.PartitionAssignments
 import surge.kafka.streams._
 
-import scala.concurrent.{ ExecutionContext, Future }
-import scala.util.{ Failure, Success, Try }
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success, Try}
 
 object SurgeMessagePipeline {
   val log: Logger = LoggerFactory.getLogger(getClass)
@@ -44,7 +43,8 @@ private[surge] abstract class SurgeMessagePipeline[S, M, +R, E](
   protected implicit val system: ActorSystem = actorSystem
   protected val stateChangeActor: ActorRef = system.actorOf(KafkaConsumerStateTrackingActor.props)
 
-  private val isAkkaClusterEnabled: Boolean = Try(config.getBoolean("surge.akka.cluster.enabled")).getOrElse(false)
+  protected val cluster: Cluster = Cluster.get(system)
+  AkkaManagement(system).start()
 
   private val partitionTracker: KafkaConsumerPartitionAssignmentTracker = new KafkaConsumerPartitionAssignmentTracker(stateChangeActor)
 
@@ -65,11 +65,8 @@ private[surge] abstract class SurgeMessagePipeline[S, M, +R, E](
     signalBus = signalBus,
     config = config)
 
-  protected val cqrsRegionCreator: PersistentActorRegionCreator[M] =
-    new PersistentActorRegionCreator[M](actorSystem, businessLogic, kafkaStreamsImpl, partitionTracker, businessLogic.metrics, signalBus, config = config)
-
   protected val actorRouter: SurgePartitionRouter =
-    SurgePartitionRouter(config, actorSystem, partitionTracker, businessLogic, kafkaStreamsImpl, cqrsRegionCreator, signalBus, isAkkaClusterEnabled)
+    SurgePartitionRouter(config, actorSystem, businessLogic, kafkaStreamsImpl, signalBus)
 
   protected val surgeHealthCheck: SurgeHealthCheck = new SurgeHealthCheck(businessLogic.aggregateName, kafkaStreamsImpl, actorRouter)(ExecutionContext.global)
 
@@ -86,7 +83,7 @@ private[surge] abstract class SurgeMessagePipeline[S, M, +R, E](
   override def start(): Future[Ack] = {
     val result = for {
       _ <- startSignalStream()
-      _ <- startClusterManagementAndRebalanceListener()
+      _ <- startKafkaClusterRebalanceListener()
       _ <- actorRouter.start()
       allStarted <- kafkaStreamsImpl.start()
     } yield {
@@ -121,18 +118,6 @@ private[surge] abstract class SurgeMessagePipeline[S, M, +R, E](
   }
 
   override def shutdown(): Future[Ack] = stop()
-
-  private def startClusterManagementAndRebalanceListener(): Future[Unit] = {
-    if (isAkkaClusterEnabled) {
-      Cluster.get(system)
-      for {
-        _ <- AkkaManagement(system).start()
-        allStarted <- startKafkaClusterRebalanceListener()
-      } yield allStarted
-    } else {
-      Future.successful()
-    }
-  }
 
   private def startKafkaClusterRebalanceListener(): Future[ActorRef] = Future.successful {
     val partitionToKafkaProducerActor = KafkaProducerActor.create(

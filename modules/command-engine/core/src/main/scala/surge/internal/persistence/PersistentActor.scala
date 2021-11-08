@@ -2,32 +2,31 @@
 
 package surge.internal.persistence
 
-import akka.actor.{ NoSerializationVerificationNeeded, Props, ReceiveTimeout, Stash, Status }
+import akka.actor.{NoSerializationVerificationNeeded, Props, ReceiveTimeout, Stash, Status}
 import akka.cluster.sharding.ShardRegion.Passivate
 import akka.pattern.pipe
 import com.fasterxml.jackson.annotation.JsonTypeInfo
-import com.typesafe.config.{ Config, ConfigFactory }
+import com.typesafe.config.{Config, ConfigFactory}
 import io.opentelemetry.api.trace.Tracer
-import org.slf4j.{ Logger, LoggerFactory }
+import org.slf4j.{Logger, LoggerFactory}
+import play.api.libs.json.JsValue
 import surge.akka.cluster.JacksonSerializable
 import surge.core._
 import surge.health.HealthSignalBusTrait
 import surge.internal.SurgeModel
 import surge.internal.akka.ActorWithTracing
-import surge.internal.config.{ RetryConfig, TimeoutConfig }
+import surge.internal.config.{RetryConfig, TimeoutConfig}
 import surge.internal.domain.HandledMessageResult
 import surge.internal.kafka.HeadersHelper
 import surge.internal.tracing.RoutableMessage
 import surge.internal.utils.DiagnosticContextFuturePropagation
 import surge.kafka.streams.AggregateStateStoreKafkaStreams
-import surge.metrics.{ MetricInfo, Metrics, Timer }
-import surge.akka.cluster.{ Passivate => SurgePassivate }
+import surge.metrics.{MetricInfo, Metrics, Timer}
 
 import java.time.Instant
 import java.util.concurrent.Executors
-import scala.concurrent.duration.{ Duration, DurationInt, FiniteDuration }
-import scala.concurrent.{ ExecutionContext, Future }
-import scala.util.Try
+import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration}
+import scala.concurrent.{ExecutionContext, Future}
 
 object PersistentActor {
 
@@ -125,10 +124,10 @@ object PersistentActor {
   def props[S, M, R, E](
       businessLogic: SurgeModel[S, M, R, E],
       signalBus: HealthSignalBusTrait,
-      regionSharedResources: PersistentEntitySharedResources,
-      config: Config,
-      aggregateIdOpt: Option[String] = None): Props = {
-    Props(new PersistentActor(businessLogic, regionSharedResources, signalBus, config, aggregateIdOpt))
+      aggregateIdToKafkaProducer: String => KafkaProducerActorWithSelection,
+      stateStore: AggregateStateStoreKafkaStreams[JsValue],
+      config: Config): Props = {
+    Props(new PersistentActor(businessLogic, aggregateIdToKafkaProducer, stateStore, signalBus, config))
   }
 
   val serializationThreadPoolSize: Int = ConfigFactory.load().getInt("surge.serialization.thread-pool-size")
@@ -138,10 +137,10 @@ object PersistentActor {
 }
 class PersistentActor[S, M, R, E](
     val businessLogic: SurgeModel[S, M, R, E],
-    val regionSharedResources: PersistentEntitySharedResources,
+    val aggregateIdToKafkaProducer: String => KafkaProducerActorWithSelection,
+    val stateStore: AggregateStateStoreKafkaStreams[JsValue],
     val signalBus: HealthSignalBusTrait,
-    config: Config,
-    val aggregateIdOpt: Option[String])
+    config: Config)
     extends ActorWithTracing
     with Stash
     with KTablePersistenceSupport[S, E]
@@ -150,12 +149,9 @@ class PersistentActor[S, M, R, E](
   import PersistentActor._
   import context.dispatcher
 
-  //FIXME: temporary fix to support switch between akka and existing shard allocation strategy
-  def aggregateId: String = aggregateIdOpt.getOrElse(self.path.name)
+  def aggregateId: String = self.path.name
 
-  private val metrics = regionSharedResources.metrics
-
-  private val isAkkaClusterEnabled: Boolean = Try(config.getBoolean("surge.akka.cluster.enabled")).getOrElse(false)
+  private val metrics = PersistentActor.createMetrics(businessLogic.metrics, businessLogic.aggregateName)
 
   private sealed trait Internal extends NoSerializationVerificationNeeded
 
@@ -180,13 +176,13 @@ class PersistentActor[S, M, R, E](
 
   override type ActorState = InternalActorState
 
-  override val initializationMetrics: KTableInitializationMetrics = regionSharedResources.metrics
+  override val initializationMetrics: KTableInitializationMetrics = metrics
 
-  override val ktablePersistenceMetrics: KTablePersistenceMetrics = regionSharedResources.metrics
+  override val ktablePersistenceMetrics: KTablePersistenceMetrics = metrics
 
-  override val kafkaProducerActor: KafkaProducerActor = regionSharedResources.aggregateIdToKafkaProducer(aggregateId)
+  override val kafkaProducerActor: KafkaProducerActorWithSelection = aggregateIdToKafkaProducer(aggregateId)
 
-  override val kafkaStreamsCommand: AggregateStateStoreKafkaStreams[_] = regionSharedResources.stateStore
+  override val kafkaStreamsCommand: AggregateStateStoreKafkaStreams[_] = stateStore
 
   override def deserializeState(bytes: Array[Byte]): Option[S] = businessLogic.aggregateReadFormatting.readState(bytes)
 
@@ -310,7 +306,7 @@ class PersistentActor[S, M, R, E](
       sender() ! ACKError(failedFuture.cause)
       context.become(freeToProcess(state))
       unstashAll()
-    case otherMsg =>
+    case _ =>
       stash()
   }
 
@@ -330,12 +326,7 @@ class PersistentActor[S, M, R, E](
   private def handlePassivate(): Unit = {
     log.trace(s"PersistentActor for aggregate ${businessLogic.aggregateName} $aggregateId is passivating gracefully")
 
-    //FIXME: temporary fix to support switch between akka and existing shard allocation strategy
-    if (isAkkaClusterEnabled) {
-      context.parent ! Passivate(Stop)
-    } else {
-      context.parent ! SurgePassivate(Stop)
-    }
+    context.parent ! Passivate(Stop)
   }
 
   private def handleStop(): Unit = {

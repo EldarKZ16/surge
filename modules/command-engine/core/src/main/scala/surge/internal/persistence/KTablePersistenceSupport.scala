@@ -3,17 +3,15 @@
 package surge.internal.persistence
 
 import akka.actor.Actor.Receive
-import akka.actor.{ ActorContext, ActorRef, NoSerializationVerificationNeeded }
+import akka.actor.{ActorContext, ActorRef, NoSerializationVerificationNeeded}
 import akka.pattern._
-import com.typesafe.config.ConfigFactory
-import io.opentelemetry.api.trace.Span
 import org.slf4j.LoggerFactory
-import surge.core.KafkaProducerActor
+import surge.core.{KafkaProducerActor, KafkaProducerActorWithSelection}
 import surge.exceptions.KafkaPublishTimeoutException
 import surge.metrics.Timer
 
 import java.time.Instant
-import scala.concurrent.{ ExecutionContext, Future }
+import scala.concurrent.{ExecutionContext, Future}
 
 trait KTablePersistenceMetrics {
   def eventPublishTimer: Timer
@@ -22,7 +20,7 @@ trait KTablePersistenceMetrics {
 trait KTablePersistenceSupport[Agg, Event] {
   protected def aggregateId: String
   protected def aggregateName: String
-  protected def kafkaProducerActor: KafkaProducerActor
+  protected def kafkaProducerActor: KafkaProducerActorWithSelection
   protected def context: ActorContext
   protected def ktablePersistenceMetrics: KTablePersistenceMetrics
   protected def self: ActorRef
@@ -49,7 +47,7 @@ trait KTablePersistenceSupport[Agg, Event] {
   private case class EventPublishTimedOut(reason: Throwable, startTime: Instant) extends Internal
 
   private def handleInternal(state: ActorState): Receive = {
-    case msg: PersistenceSuccess   => handle(state, msg)
+    case msg: PersistenceSuccess   => handle(msg)
     case msg: PersistenceFailure   => handleFailedToPersist(state, msg)
     case msg: EventPublishTimedOut => handlePersistenceTimedOut(state, msg)
   }
@@ -109,7 +107,7 @@ trait KTablePersistenceSupport[Agg, Event] {
     Instant.now.toEpochMilli - startTime.toEpochMilli
   }
 
-  private def handle(state: ActorState, msg: PersistenceSuccess): Unit = {
+  private def handle(msg: PersistenceSuccess): Unit = {
     ktablePersistenceMetrics.eventPublishTimer.recordTime(publishTimeInMillis(msg.startTime))
     onPersistenceSuccess(msg.newState)
   }
